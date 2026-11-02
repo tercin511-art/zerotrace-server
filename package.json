@@ -1,0 +1,19 @@
+{
+  "name": "zerotrace-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ZeroTrace — мини-сервер выдачи LiveKit access-токенов",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=19"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "livekit-server-sdk": "^2.19.2"
+  }
+}

@@ -1,24 +1,24 @@
 /**
- * ZeroTrace — мини-сервер выдачи LiveKit access-токенов.
+ * ZeroTrace — мини-сервер LiveKit-токенов и онлайн-статусов.
  *
  * Зачем: телефон не должен носить в себе готовый токен (он живёт минуты и один на всех —
- * второй участник выбивает первого из комнаты, т.к. у обоих одинаковый identity).
- * Приложение спрашивает токен здесь, сервер подписывает его API-секретом, который
- * никогда не покидает сервер.
+ * второй участник выбивает первого из комнаты). Приложение спрашивает токен здесь,
+ * сервер подписывает его API-секретом, который никогда не покидает сервер.
  *
- * Переменные окружения (на Render задаются в дашборде, локально — в файле .env):
- *   LIVEKIT_URL        wss://<проект>.livekit.cloud
- *   LIVEKIT_API_KEY    API-ключ LiveKit
- *   LIVEKIT_API_SECRET секрет API-ключа (никому не показывать!)
- *   PORT               порт (Render задаёт сам; локально по умолчанию 3000)
- *   TOKEN_TTL          время жизни токена: '30m', '1h', '2 days' (по умолчанию '1h')
+ * Переменные окружения (на Render — в дашборде, локально — в файле .env):
+ *   LIVEKIT_URL           wss://<проект>.livekit.cloud
+ *   LIVEKIT_API_KEY       API-ключ LiveKit
+ *   LIVEKIT_API_SECRET    секрет API-ключа (никому не показывать!)
+ *   PORT                  порт (Render задаёт сам; локально 3000)
+ *   TOKEN_TTL             время жизни токена: '30m', '1h' (по умолчанию '1h')
+ *   PRESENCE_WINDOW_MS    сколько считать человека «в сети» после сигнала (по умолчанию 45000)
  *
  * Эндпоинты:
- *   GET  /health                                       — для health-check Render
- *   GET  /token?room=<комната>&identity=<id>&name=<имя>
- *   POST /token   { "room": "...", "identity": "...", "name": "..." }
- *
- * Ответ: { "url": "wss://...", "token": "<JWT>", "room": "...", "identity": "...", "ttl": "1h" }
+ *   GET  /health                                        — health-check для Render
+ *   GET  /token?room=<комната>&identity=<id>&name=<имя> — токен LiveKit
+ *   POST /token  { "room": "...", "identity": "...", "name": "..." }
+ *   POST /presence { "phone": "+79991234567", "identity": "...", "room": "..." } — «я в сети»
+ *   GET  /presence                                      — кто сейчас в сети
  */
 
 import express from 'express';
@@ -31,8 +31,7 @@ import { AccessToken } from 'livekit-server-sdk';
 const here = dirname(fileURLToPath(import.meta.url));
 
 // Локальная разработка: подхватываем .env рядом с server.js.
-// На Render этот файл не нужен — там переменные приходят из дашборда.
-// Отдельная зависимость dotenv для этого не требуется.
+// На Render файл не нужен — переменные приходят из дашборда.
 const envFile = join(here, '.env');
 if (existsSync(envFile)) {
   for (const line of readFileSync(envFile, 'utf8').split(/\r?\n/)) {
@@ -50,6 +49,10 @@ const PORT = Number(process.env.PORT ?? 3000);
 const TOKEN_TTL = process.env.TOKEN_TTL ?? '1h';
 // Render требует слушать 0.0.0.0, а не только localhost.
 const HOST = process.env.HOST ?? '0.0.0.0';
+/** Сколько миллисекунд считаем человека «в сети» после последнего сигнала. */
+const PRESENCE_WINDOW_MS = Number(process.env.PRESENCE_WINDOW_MS ?? 45000);
+/** Через сколько выбрасываем давно молчащие записи, чтобы память не росла. */
+const PRESENCE_KEEP_MS = 10 * 60 * 1000;
 
 if (!LIVEKIT_URL || !API_KEY || !API_SECRET) {
   console.error(
@@ -63,7 +66,7 @@ if (!LIVEKIT_URL || !API_KEY || !API_SECRET) {
 // ---------------------------------------------------------------- утилиты
 
 // Identity и имя комнаты попадают в логи LiveKit — держим только «безопасные» символы
-// и не кладём туда телефоны/ФИО (используем непрозрачный id).
+// и не кладём туда ФИО (используем непрозрачный id).
 const SAFE_NAME = /^[A-Za-z0-9_.:@+-]{1,64}$/;
 
 function firstDefined(...values) {
@@ -73,6 +76,15 @@ function firstDefined(...values) {
     }
   }
   return undefined;
+}
+
+/** Оставляем только цифры и последние 10 знаков: «+7 999…» и «8 999…» совпадут. */
+function normalizePhone(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  const digits = value.replace(/\D/g, '');
+  return digits.length > 10 ? digits.slice(-10) : digits;
 }
 
 /** Создаёт JWT: уникальный identity + право входа в конкретную комнату. */
@@ -93,6 +105,65 @@ async function createToken({ room, identity, name }) {
 
   // В серверном SDK v2 toJwt() асинхронный.
   return accessToken.toJwt();
+}
+
+// ---------------------------------------------------------------- присутствие
+
+/**
+ * Кто в сети. Храним в памяти процесса: на бесплатном тарифе Render это одна
+ * инстанция, поэтому такой вариант рабочий. При перезапуске сервиса карта очищается —
+ * приложение тут же снова пришлёт «я в сети» (heartbeat каждые 15 секунд).
+ */
+const presenceByPhone = new Map();
+
+function purgePresence(now) {
+  for (const [phone, entry] of presenceByPhone) {
+    if (now - entry.lastSeen > PRESENCE_KEEP_MS) {
+      presenceByPhone.delete(phone);
+    }
+  }
+}
+
+function onlinePhones(now) {
+  const result = [];
+  for (const [phone, entry] of presenceByPhone) {
+    if (now - entry.lastSeen <= PRESENCE_WINDOW_MS) {
+      result.push(phone);
+    }
+  }
+  return result;
+}
+
+/** POST /presence — «я в сети». */
+function reportPresence(req, res) {
+  const body = req.body ?? {};
+  const phone = normalizePhone(
+    firstDefined(req.query.phone, body.phone, req.query.number, body.number),
+  );
+
+  if (!phone) {
+    res.status(400).json({ error: 'Укажите свой номер: параметр "phone" обязателен.' });
+    return;
+  }
+
+  const now = Date.now();
+  presenceByPhone.set(phone, {
+    lastSeen: now,
+    identity: firstDefined(req.query.identity, body.identity) ?? '',
+    room: firstDefined(req.query.room, body.room) ?? '',
+  });
+  purgePresence(now);
+
+  res.json({ ok: true, windowMs: PRESENCE_WINDOW_MS, online: onlinePhones(now).length });
+}
+
+/** GET /presence — кто сейчас в сети. */
+function getPresence(req, res) {
+  const now = Date.now();
+  purgePresence(now);
+  const online = onlinePhones(now);
+  console.log(`[presence] online=${online.length}`);
+  res.json({ windowMs: PRESENCE_WINDOW_MS, count: online.length, online });
 }
 
 // ---------------------------------------------------------------- сервер
@@ -116,7 +187,7 @@ app.use((req, res, next) => {
 
 // Health-check: Render опрашивает этот путь, чтобы понять, что сервис поднялся.
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', url: LIVEKIT_URL, ttl: TOKEN_TTL });
+  res.json({ status: 'ok', url: LIVEKIT_URL, ttl: TOKEN_TTL, presenceWindowMs: PRESENCE_WINDOW_MS });
 });
 
 async function issueToken(req, res) {
@@ -179,21 +250,25 @@ async function issueToken(req, res) {
 
 app.get('/token', issueToken);
 app.post('/token', issueToken);
+app.get('/presence', getPresence);
+app.post('/presence', reportPresence);
 
 app.get('/', (req, res) => {
   res.type('text/plain').send(
     'ZeroTrace token server\n\n' +
       'GET  /health\n' +
       'GET  /token?room=test&identity=zerotrace-ab12cd\n' +
-      'POST /token  {"room":"test","identity":"zerotrace-ab12cd","name":"Pixel 7"}\n',
+      'POST /token     {"room":"test","identity":"zerotrace-ab12cd","name":"Pixel 7"}\n' +
+      'POST /presence  {"phone":"+79991234567","identity":"zerotrace-ab12cd","room":"test"}\n' +
+      'GET  /presence\n',
   );
 });
 
 app.listen(PORT, HOST, () => {
   const publicUrl = process.env.RENDER_EXTERNAL_URL;
   console.log(`ZeroTrace token server слушает ${HOST}:${PORT}`);
-  console.log(`LiveKit URL: ${LIVEKIT_URL}, TTL: ${TOKEN_TTL}`);
+  console.log(`LiveKit URL: ${LIVEKIT_URL}, TTL: ${TOKEN_TTL}, presence window: ${PRESENCE_WINDOW_MS} ms`);
   if (publicUrl) {
-    console.log(`Публичный адрес для приложения: ${publicUrl}/token`);
+    console.log(`Публичный адрес для приложения: ${publicUrl}`);
   }
 });

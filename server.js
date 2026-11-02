@@ -9,7 +9,11 @@ const LIVEKIT_URL = process.env.LIVEKIT_URL;
 const API_KEY = process.env.LIVEKIT_API_KEY;
 const API_SECRET = process.env.LIVEKIT_API_SECRET;
 
-app.get('/health', (req, res) => {
+app.get('/', (req, res) => {
+    res.send('ZeroTrace Server is running!');
+});
+
+app.get('/ping', (req, res) => {
     res.json({ status: 'ok' });
 });
 
